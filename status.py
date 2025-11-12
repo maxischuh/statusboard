@@ -304,7 +304,8 @@ def get_mvv_image_cached(state):
 
     canvas = Image.new("1", (W, H), 255)
     if state.get("png_path") and os.path.exists(state["png_path"]):
-        src = Image.open(state["png_path"]).convert("L")
+        with Image.open(state["png_path"]) as src_raw:
+            src = src_raw.convert("L")
         src.thumbnail((W - 80, H - 120))
         x = (W - src.width) // 2
         y = (H - src.height) // 2
