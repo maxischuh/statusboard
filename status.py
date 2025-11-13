@@ -7,6 +7,7 @@ Private details such as timezone, coordinates, and MVV configuration live in
 and adjust it for your setup before running this script.
 """
 
+import io
 import logging
 import os
 import sys
@@ -250,15 +251,32 @@ def init_browser():
     return driver, tmp.name
 
 
-def grab_mvv_png(driver, out_png):
+def grab_mvv_png(driver):
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
 
-    WebDriverWait(driver, 30).until(
+    element = WebDriverWait(driver, 30).until(
         EC.presence_of_element_located((By.CSS_SELECTOR, ".mvv-departure-monitor"))
     )
-    driver.find_element(By.CSS_SELECTOR, ".mvv-departure-monitor").screenshot(out_png)
+    return element.screenshot_as_png
+
+
+def reset_mvv_driver(state):
+    driver = state.pop("driver", None)
+    if driver:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+    html_path = state.pop("html_path", None)
+    if html_path and os.path.exists(html_path):
+        try:
+            os.unlink(html_path)
+        except OSError:
+            pass
+    for key in ("png_bytes", "png_path", "last_reload", "last_shot"):
+        state.pop(key, None)
 
 
 def get_mvv_image_cached(state):
@@ -279,9 +297,18 @@ def get_mvv_image_cached(state):
         try:
             state["driver"], state["html_path"] = init_browser()
         except Exception as exc:
+            logging.warning("MVV screenshot update failed: %s", exc)
             state["err"] = f"MVV: {exc}".splitlines()[0]
+            reset_mvv_driver(state)
             return Image.new("1", (W, H), 255), state["err"]
         state["last_reload"] = 0.0
+
+    legacy_png = state.pop("png_path", None)
+    if legacy_png and os.path.exists(legacy_png):
+        try:
+            os.unlink(legacy_png)
+        except OSError:
+            pass
 
     if (now - state.get("last_shot", 0)) > MVV_REFRESH:
         try:
@@ -294,27 +321,35 @@ def get_mvv_image_cached(state):
                     pass
                 state["last_reload"] = now
 
-            png = state.get("png_path") or tempfile.mktemp(suffix=".png")
-            grab_mvv_png(state["driver"], png)
-            state["png_path"] = png
+            state["png_bytes"] = grab_mvv_png(state["driver"])
             state["last_shot"] = now
             state["err"] = None
         except Exception as exc:
+            logging.warning("MVV screenshot update failed: %s", exc)
             state["err"] = f"MVV: {exc}".splitlines()[0]
+            reset_mvv_driver(state)
 
     canvas = Image.new("1", (W, H), 255)
-    if state.get("png_path") and os.path.exists(state["png_path"]):
-        with Image.open(state["png_path"]) as src_raw:
-            src = src_raw.convert("L")
-        src.thumbnail((W - 80, H - 120))
-        x = (W - src.width) // 2
-        y = (H - src.height) // 2
-        canvas.paste(src.convert("1"), (x, y))
-        d = ImageDraw.Draw(canvas)
-        d.rectangle((x - 10, y - 10, x + src.width + 10, y + src.height + 10), outline=0, width=2)
-    else:
-        d = ImageDraw.Draw(canvas)
-        d.text((40, H // 2 - 20), state.get("err") or "MVV Monitor nicht verfügbar", font=FONT_SM, fill=0)
+    png_bytes = state.get("png_bytes")
+    if png_bytes:
+        try:
+            with Image.open(io.BytesIO(png_bytes)) as src_raw:
+                src = src_raw.convert("L")
+        except OSError as exc:
+            logging.warning("Failed to decode MVV screenshot: %s", exc)
+            state["err"] = f"MVV: {exc}".splitlines()[0]
+            state.pop("png_bytes", None)
+        else:
+            src.thumbnail((W - 80, H - 120))
+            x = (W - src.width) // 2
+            y = (H - src.height) // 2
+            canvas.paste(src.convert("1"), (x, y))
+            d = ImageDraw.Draw(canvas)
+            d.rectangle((x - 10, y - 10, x + src.width + 10, y + src.height + 10), outline=0, width=2)
+            return canvas, state.get("err")
+
+    d = ImageDraw.Draw(canvas)
+    d.text((40, H // 2 - 20), state.get("err") or "MVV Monitor nicht verfügbar", font=FONT_SM, fill=0)
     return canvas, state.get("err")
 
 
@@ -519,12 +554,7 @@ def main():
         logging.error("Unhandled error: %s", exc)
         traceback.print_exc()
     finally:
-        driver = mvv_state.get("driver")
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
+        reset_mvv_driver(mvv_state)
         try:
             epd.sleep()
         except Exception:
