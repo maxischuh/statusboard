@@ -418,7 +418,7 @@ def draw_slide_weather(img, weather, rain_eta, err=None):
         if temp is not None:
             text = f"{round(temp)}°C"
             if feels is not None:
-                text += f" (gefühlt {round(feels)}°)"
+                text += f" (gefühlt {round(feels)}°C)"
             d.text((40, y), text, font=FONT_BIG, fill=0)
             y += d.textbbox((0, 0), text, font=FONT_BIG)[3] + 6
 

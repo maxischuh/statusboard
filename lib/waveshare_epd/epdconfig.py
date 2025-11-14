@@ -58,6 +58,7 @@ class RaspberryPi:
         # self.GPIO_CS_PIN     = gpiozero.LED(self.CS_PIN)
         self.GPIO_PWR_PIN    = gpiozero.LED(self.PWR_PIN)
         self.GPIO_BUSY_PIN   = gpiozero.Button(self.BUSY_PIN, pull_up = False)
+        self._spi_open = False
 
         
 
@@ -139,15 +140,20 @@ class RaspberryPi:
             self.DEV_SPI.DEV_Module_Init()
 
         else:
+            if self._spi_open:
+                return 0
             # SPI device, bus = 0, device = 0
             self.SPI.open(0, 0)
             self.SPI.max_speed_hz = 4000000
             self.SPI.mode = 0b00
+            self._spi_open = True
         return 0
 
     def module_exit(self, cleanup=False):
         logger.debug("spi end")
-        self.SPI.close()
+        if self._spi_open:
+            self.SPI.close()
+            self._spi_open = False
 
         self.GPIO_RST_PIN.off()
         self.GPIO_DC_PIN.off()
