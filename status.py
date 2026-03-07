@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # ---------------------------------------------------------------------------
 # Paths and private settings
@@ -78,8 +78,14 @@ PROG_GAP = 6
 PROG_BASE_THICK = 1
 PROG_FILL_THICK = 3
 TOP_ERASE_H = 2
+MVV_BW_THRESHOLD = 190
 
 FONT_PATH = PIC_DIR / "Font.ttc"
+
+try:
+    RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
+except AttributeError:
+    RESAMPLE_LANCZOS = Image.LANCZOS
 
 
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
@@ -262,6 +268,15 @@ def grab_mvv_png(driver):
     return element.screenshot_as_png
 
 
+def prepare_mvv_screenshot(src_raw):
+    # Flatten alpha and force a crisp 1-bit image to avoid e-paper stripe artifacts.
+    src_rgba = src_raw.convert("RGBA")
+    src = Image.alpha_composite(Image.new("RGBA", src_rgba.size, "WHITE"), src_rgba).convert("L")
+    src = ImageOps.autocontrast(src, cutoff=1)
+    src.thumbnail((W - 80, H - 120), resample=RESAMPLE_LANCZOS)
+    return src.point(lambda px: 0 if px < MVV_BW_THRESHOLD else 255, "1")
+
+
 def reset_mvv_driver(state):
     driver = state.pop("driver", None)
     if driver:
@@ -334,16 +349,15 @@ def get_mvv_image_cached(state):
     if png_bytes:
         try:
             with Image.open(io.BytesIO(png_bytes)) as src_raw:
-                src = src_raw.convert("L")
+                src = prepare_mvv_screenshot(src_raw)
         except OSError as exc:
             logging.warning("Failed to decode MVV screenshot: %s", exc)
             state["err"] = f"MVV: {exc}".splitlines()[0]
             state.pop("png_bytes", None)
         else:
-            src.thumbnail((W - 80, H - 120))
             x = (W - src.width) // 2
             y = (H - src.height) // 2
-            canvas.paste(src.convert("1"), (x, y))
+            canvas.paste(src, (x, y))
             d = ImageDraw.Draw(canvas)
             d.rectangle((x - 10, y - 10, x + src.width + 10, y + src.height + 10), outline=0, width=2)
             return canvas, state.get("err")
