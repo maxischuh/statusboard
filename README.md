@@ -43,6 +43,7 @@ python3 status.py --preview frankfurt-previews --preview-city frankfurt-am-main
 - MVG departures are fetched as structured EFA JSON rows, cached in memory, and retried with backoff during outages.
 - Logging is intentionally compact: startup, periodic heartbeat, bounded MVV success logs, warnings, and display recovery events without dumping API payloads.
 - The dashboard coalesces clock and data changes into a single refresh when possible.
+- The e-paper panel gets a full refresh every 15 minutes to reduce ghosting.
 - The systemd service restarts the process if it exits unexpectedly, without requiring a Raspberry Pi reboot.
 
 ## Run on Boot (systemd)
