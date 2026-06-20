@@ -16,3 +16,6 @@ LON = 11
 # You can grab the snippet from https://www.mvv-muenchen.de/ by configuring your stop
 # and copying the "embed" HTML.
 MVV_HTML = ""
+
+# Optional logging verbosity: DEBUG, INFO, WARNING, ERROR.
+LOG_LEVEL = "INFO"

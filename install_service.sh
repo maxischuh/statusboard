@@ -47,6 +47,9 @@ KillSignal=SIGINT
 TimeoutStopSec=20
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=statusboard
+LogRateLimitIntervalSec=1min
+LogRateLimitBurst=120
 SupplementaryGroups=spi gpio
 
 [Install]

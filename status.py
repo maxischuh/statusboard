@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Cycle weather and MVV information on the Waveshare 7.5" e-paper display.
+Render weather and MVV information on the Waveshare 7.5" e-paper display.
 
 Private details such as timezone, coordinates, and MVV configuration live in
 `local_settings.py`, which is intentionally gitignored. Copy the example file
 and adjust it for your setup before running this script.
 """
 
-import io
 import argparse
-import gc
+import base64
+import json
 import logging
 import os
+import re
 import sys
-import tempfile
 import time
 import traceback
 from datetime import datetime
@@ -84,22 +84,17 @@ FULL_REFRESH = 60 * 60
 RAIN_THRESHOLD_MM = 0.1
 RAIN_WINDOW_STEPS = 8
 
-MVV_BW_THRESHOLD = 190
-MVV_CROP_THRESHOLD = 245
-MVV_CROP_PADDING = 10
-MVV_PAGE_LOAD_TIMEOUT = 45
-MVV_WAIT_TIMEOUT = 25
-MVV_RELOAD_INTERVAL = 10 * 60
-MVV_BROWSER_MAX_AGE = 6 * 60 * 60
+MVV_EFA_URL = "https://efa.mvv-muenchen.de/ng/XML_DM_REQUEST"
+MVV_FETCH_LIMIT_MARGIN = 3
 MVV_RETRY_BASE = 5 * 60
 MVV_RETRY_MAX = 30 * 60
-MVV_MAX_SCREENSHOT_BYTES = 2 * 1024 * 1024
-MVV_TMP_PREFIX = "statusboard-mvv-"
-STALE_TMP_AGE = 24 * 60 * 60
+MVV_SUCCESS_LOG_INTERVAL = 30 * 60
+STATUS_LOG_INTERVAL = 60 * 60
 
 REQUEST_TIMEOUT = 10
 DISPLAY_MAX_RETRIES = 2
 DISPLAY_RECOVERY_SLEEP = 5
+LOG_LEVEL = str(_optional_setting("LOG_LEVEL", "INFO")).upper()
 
 OUTER_PAD = 16
 PANEL_TOP = 14
@@ -279,140 +274,143 @@ def fetch_rain_eta(threshold: float = RAIN_THRESHOLD_MM):
 # ---------------------------------------------------------------------------
 # MVV widget helpers
 # ---------------------------------------------------------------------------
-def init_browser():
-    if not MVV_HTML:
-        raise RuntimeError("MVV HTML snippet not configured.")
+def decode_mvv_monitor_config(html_text):
+    if not html_text:
+        return None
 
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-    from selenium.common.exceptions import TimeoutException
+    candidates = []
+    for pattern in (
+        r'monitor-configuration=["\']([^"\']+)["\']',
+        r'MONITOR_CONFIGURATION\s*=\s*["\']([^"\']+)["\']',
+    ):
+        candidates.extend(re.findall(pattern, html_text))
+    candidates.extend(re.findall(r"[A-Za-z0-9+/=]{80,}", html_text))
 
-    driver = None
-    tmp_path = None
-    try:
-        tmp = tempfile.NamedTemporaryFile(delete=False, prefix=MVV_TMP_PREFIX, suffix=".html")
-        tmp_path = tmp.name
-        tmp.write(MVV_HTML.encode("utf-8"))
-        tmp.flush()
-        tmp.close()
-
-        opts = Options()
-        opts.add_argument("--headless=new")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--disable-extensions")
-        opts.add_argument("--disable-background-networking")
-        opts.add_argument("--disable-sync")
-        opts.add_argument("--remote-allow-origins=*")
-        opts.add_argument("--window-size=800,480")
-        try:
-            opts.page_load_strategy = "none"
-        except Exception:
-            pass
-
-        svc_path = "/usr/bin/chromedriver"
-        service = Service(svc_path) if os.path.exists(svc_path) else Service()
-        driver = webdriver.Chrome(service=service, options=opts)
-        driver.set_page_load_timeout(MVV_PAGE_LOAD_TIMEOUT)
-        driver.set_script_timeout(MVV_PAGE_LOAD_TIMEOUT)
-        try:
-            driver.get("file://" + tmp_path)
-        except TimeoutException:
-            pass
-    except Exception:
-        if driver:
+    for raw in candidates:
+        value = raw.strip()
+        padding = "=" * (-len(value) % 4)
+        for encoding in ("utf-8", "latin-1"):
             try:
-                driver.quit()
+                decoded = base64.b64decode(value + padding).decode(encoding)
+                data = json.loads(decoded)
             except Exception:
-                pass
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-        raise
-
-    return driver, tmp_path
+                continue
+            if isinstance(data, dict) and data.get("stations"):
+                return data
+    return None
 
 
-def grab_mvv_png(driver):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-
-    element = WebDriverWait(driver, MVV_WAIT_TIMEOUT).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, ".mvv-departure-monitor"))
+def load_mvv_config(state):
+    config = state.get("config")
+    if config is not None:
+        return config
+    config = decode_mvv_monitor_config(MVV_HTML)
+    if not config:
+        raise RuntimeError("MVV Monitor-Konfiguration nicht lesbar")
+    state["config"] = config
+    logging.info(
+        "MVV config loaded: stations=%s max_results=%s",
+        len(config.get("stations") or []),
+        config.get("maxResults", 5),
     )
-    return element.screenshot_as_png
+    return config
 
 
-def cleanup_stale_mvv_temp_files():
-    now = time.time()
-    for path in Path(tempfile.gettempdir()).glob(f"{MVV_TMP_PREFIX}*.html"):
+def selected_line_keys(station_config):
+    lines = station_config.get("lines") or station_config.get("allLines") or []
+    keys = set()
+    for line in lines:
+        stateless = line.get("stateless")
+        number = line.get("number")
+        direction = line.get("direction")
+        if stateless:
+            keys.add(("stateless", stateless))
+        if number:
+            keys.add(("number", number))
+        if number and direction:
+            keys.add(("number_direction", number, direction))
+    return keys
+
+
+def line_is_selected(serving_line, keys):
+    if not keys:
+        return True
+    number = serving_line.get("number") or serving_line.get("lineDisplay")
+    direction = serving_line.get("direction")
+    stateless = serving_line.get("stateless")
+    return (
+        ("stateless", stateless) in keys
+        or ("number", number) in keys
+        or ("number_direction", number, direction) in keys
+    )
+
+
+def fetch_mvv_station_departures(station_config, max_results):
+    import urllib.parse
+    import urllib.request
+
+    station = station_config.get("station") or {}
+    station_id = station.get("id") or station.get("stateless") or (station.get("ref") or {}).get("id")
+    if not station_id:
+        return []
+
+    params = {
+        "outputFormat": "JSON",
+        "language": "de",
+        "mode": "direct",
+        "type_dm": "stop",
+        "name_dm": station_id,
+        "useRealtime": "1",
+        "limit": str(max_results + MVV_FETCH_LIMIT_MARGIN),
+    }
+    url = MVV_EFA_URL + "?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    lead_time = int(station_config.get("leadTimeMinutes") or 0)
+    line_keys = selected_line_keys(station_config)
+    rows = []
+    for departure in data.get("departureList") or []:
+        serving_line = departure.get("servingLine") or {}
+        if not line_is_selected(serving_line, line_keys):
+            continue
+
+        countdown = departure.get("countdown")
         try:
-            if now - path.stat().st_mtime > STALE_TMP_AGE:
-                path.unlink()
-        except OSError:
-            pass
+            minutes = int(countdown)
+        except (TypeError, ValueError):
+            continue
+        if minutes < lead_time:
+            continue
 
-
-def crop_mvv_content(src):
-    ink = src.point(lambda px: 255 if px < MVV_CROP_THRESHOLD else 0, "L")
-    bbox = ink.getbbox()
-    if not bbox:
-        return src
-    left, top, right, bottom = bbox
-    if (right - left) < 40 or (bottom - top) < 40:
-        return src
-    return src.crop(
-        (
-            max(0, left - MVV_CROP_PADDING),
-            max(0, top - MVV_CROP_PADDING),
-            min(src.width, right + MVV_CROP_PADDING),
-            min(src.height, bottom + MVV_CROP_PADDING),
+        line = serving_line.get("number") or serving_line.get("lineDisplay") or serving_line.get("name")
+        destination = serving_line.get("direction") or departure.get("nameWO")
+        if not line or not destination:
+            continue
+        rows.append(
+            {
+                "line": str(line),
+                "destination": str(destination),
+                "minutes": minutes,
+                "platform": departure.get("platform") or departure.get("platformName"),
+            }
         )
-    )
+    return rows
 
 
-def prepare_mvv_screenshot(src_raw, fit_size):
-    # Flatten alpha and force a crisp 1-bit image to avoid e-paper stripe artifacts.
-    src_rgba = src_raw.convert("RGBA")
-    src = Image.alpha_composite(Image.new("RGBA", src_rgba.size, "WHITE"), src_rgba).convert("L")
-    src = ImageOps.autocontrast(src, cutoff=1)
-    src = crop_mvv_content(src)
-    fit_w = max(1, int(fit_size[0]))
-    fit_h = max(1, int(fit_size[1]))
-    src.thumbnail((fit_w, fit_h), resample=RESAMPLE_LANCZOS)
-    return src.point(lambda px: 0 if px < MVV_BW_THRESHOLD else 255, "1")
+def fetch_mvv_departures(config):
+    max_results = int(config.get("maxResults") or 5)
+    rows = []
+    for station_config in config.get("stations") or []:
+        rows.extend(fetch_mvv_station_departures(station_config, max_results))
+    rows.sort(key=lambda row: row["minutes"])
+    return rows[:max_results]
 
 
-def reset_mvv_driver(state, *, discard_cache=False):
-    driver = state.pop("driver", None)
-    if driver:
-        try:
-            driver.quit()
-        except Exception:
-            pass
-    html_path = state.pop("html_path", None)
-    if html_path and os.path.exists(html_path):
-        try:
-            os.unlink(html_path)
-        except OSError:
-            pass
-    legacy_png = state.pop("png_path", None)
-    if legacy_png and os.path.exists(legacy_png):
-        try:
-            os.unlink(legacy_png)
-        except OSError:
-            pass
-    for key in ("last_reload", "driver_started"):
-        state.pop(key, None)
+def reset_mvv_state(state, *, discard_cache=False):
     if discard_cache:
-        for key in ("png_bytes", "last_shot", "last_shot_wall"):
+        for key in ("departures", "last_update_wall", "last_update", "config"):
             state.pop(key, None)
-    gc.collect()
 
 
 def mark_mvv_failure(state, now, message):
@@ -420,77 +418,41 @@ def mark_mvv_failure(state, now, message):
     state["failures"] = failures
     state["err"] = message
     state["next_attempt"] = now + min(MVV_RETRY_MAX, MVV_RETRY_BASE * failures)
-    reset_mvv_driver(state)
+    reset_mvv_state(state)
 
 
-def decode_mvv_cached_image(state, fit_size):
-    png_bytes = state.get("png_bytes")
-    if not png_bytes:
-        return None
-    try:
-        with Image.open(io.BytesIO(png_bytes)) as src_raw:
-            return prepare_mvv_screenshot(src_raw, fit_size)
-    except OSError as exc:
-        logging.warning("Failed to decode MVV screenshot: %s", exc)
-        state["err"] = f"MVV: {exc}".splitlines()[0]
-        state.pop("png_bytes", None)
-        return None
+def maybe_log_mvv_success(state, rows):
+    now = time.monotonic()
+    if now - state.get("last_success_log", 0) >= MVV_SUCCESS_LOG_INTERVAL:
+        logging.info("MVV update ok: rows=%s", len(rows))
+        state["last_success_log"] = now
 
 
-def get_mvv_image_cached(state, fit_size):
+def get_mvv_departures_cached(state):
     if not MVV_HTML:
         state["err"] = "MVV Monitor nicht konfiguriert"
         return None, state["err"]
 
     now = time.monotonic()
-    if "driver" in state and now - state.get("driver_started", now) > MVV_BROWSER_MAX_AGE:
-        logging.info("Restarting MVV browser after %.1f hours", MVV_BROWSER_MAX_AGE / 3600)
-        reset_mvv_driver(state)
+    if now < state.get("next_attempt", 0):
+        return state.get("departures"), state.get("err")
 
-    if "driver" not in state:
-        if now < state.get("next_attempt", 0):
-            return decode_mvv_cached_image(state, fit_size), state.get("err")
+    if (now - state.get("last_update", 0)) > MVV_REFRESH:
         try:
-            state["driver"], state["html_path"] = init_browser()
-            state["driver_started"] = now
-        except Exception as exc:
-            logging.warning("MVV screenshot update failed: %s", exc)
-            mark_mvv_failure(state, now, f"MVV: {exc}".splitlines()[0])
-            return decode_mvv_cached_image(state, fit_size), state.get("err")
-        state["last_reload"] = 0.0
-
-    legacy_png = state.pop("png_path", None)
-    if legacy_png and os.path.exists(legacy_png):
-        try:
-            os.unlink(legacy_png)
-        except OSError:
-            pass
-
-    if (now - state.get("last_shot", 0)) > MVV_REFRESH:
-        try:
-            if (now - state.get("last_reload", 0)) > MVV_RELOAD_INTERVAL:
-                from selenium.common.exceptions import TimeoutException
-
-                try:
-                    state["driver"].get("file://" + state["html_path"])
-                except TimeoutException:
-                    pass
-                state["last_reload"] = now
-
-            png_bytes = grab_mvv_png(state["driver"])
-            if len(png_bytes) > MVV_MAX_SCREENSHOT_BYTES:
-                raise RuntimeError(f"screenshot too large ({len(png_bytes)} bytes)")
-            state["png_bytes"] = png_bytes
-            state["last_shot"] = now
-            state["last_shot_wall"] = time.time()
+            config = load_mvv_config(state)
+            rows = fetch_mvv_departures(config)
+            state["departures"] = rows
+            state["last_update"] = now
+            state["last_update_wall"] = time.time()
             state["failures"] = 0
             state["next_attempt"] = 0
             state["err"] = None
+            maybe_log_mvv_success(state, rows)
         except Exception as exc:
-            logging.warning("MVV screenshot update failed: %s", exc)
+            logging.warning("MVV data update failed: %s", exc)
             mark_mvv_failure(state, now, f"MVV: {exc}".splitlines()[0])
 
-    return decode_mvv_cached_image(state, fit_size), state.get("err")
+    return state.get("departures"), state.get("err")
 
 
 # ---------------------------------------------------------------------------
@@ -632,18 +594,65 @@ def draw_time_weather_panel(draw, weather, rain_eta, err, now_ts=None):
             metric_y += 30
 
 
-def draw_mvv_card(img, draw, mvv_img, mvv_err, mvv_state):
-    updated = mvv_state.get("last_shot_wall")
+def normalize_departure_row(row):
+    if isinstance(row, dict):
+        return {
+            "line": str(row.get("line") or ""),
+            "destination": str(row.get("destination") or ""),
+            "minutes": row.get("minutes"),
+        }
+    line, destination, minutes = row
+    return {"line": str(line), "destination": str(destination), "minutes": minutes}
+
+
+def draw_departures_table(draw, rows, box):
+    x1, y1, x2, y2 = box
+    width = x2 - x1
+    draw.text((x1, y1), "Linie", font=FONT_CAPTION, fill=0)
+    draw.text((x1 + 76, y1), "Ziel", font=FONT_CAPTION, fill=0)
+    min_text = "Min"
+    draw.text((x2 - text_width(draw, min_text, FONT_CAPTION), y1), min_text, font=FONT_CAPTION, fill=0)
+    draw.line((x1, y1 + 28, x2, y1 + 28), fill=0, width=1)
+
+    y = y1 + 40
+    row_h = 44
+    for raw_row in rows:
+        if y + row_h > y2:
+            break
+        row = normalize_departure_row(raw_row)
+        if not row["line"] or not row["destination"]:
+            continue
+
+        draw.rectangle((x1, y, x1 + 60, y + 28), fill=0)
+        line_w = text_width(draw, row["line"], FONT_BODY)
+        draw.text((x1 + max(4, (60 - line_w) // 2), y + 3), row["line"], font=FONT_BODY, fill=255)
+
+        dest = ellipsize(draw, row["destination"], FONT_BODY, width - 150)
+        draw.text((x1 + 76, y + 2), dest, font=FONT_BODY, fill=0)
+
+        minutes = str(row["minutes"])
+        minutes_w = text_width(draw, minutes, FONT_BODY)
+        draw.text((x2 - minutes_w, y + 2), minutes, font=FONT_BODY, fill=0)
+
+        draw.line((x1, y + row_h - 5, x2, y + row_h - 5), fill=0, width=1)
+        y += row_h
+
+
+def draw_mvv_card(draw, departures, mvv_err, mvv_state, title="MVG Abfahrten"):
+    updated = mvv_state.get("last_update_wall")
     subtitle = f"Update {time.strftime('%H:%M', time.localtime(updated))}" if updated else "Lade..."
-    draw_card_frame(draw, RIGHT_CARD, "MVG Abfahrten", subtitle)
+    draw_card_frame(draw, RIGHT_CARD, title, subtitle)
     x1, y1, x2, y2 = RIGHT_CONTENT
-    if mvv_img is not None:
-        px = x1 + (x2 - x1 - mvv_img.width) // 2
-        py = y1 + (y2 - y1 - mvv_img.height) // 2
-        img.paste(mvv_img, (px, py))
+    if departures:
+        draw_departures_table(draw, departures, (x1, y1, x2, y2))
         return
 
-    message = mvv_err or "MVG Daten werden geladen."
+    if mvv_err:
+        message = mvv_err
+    elif updated:
+        message = "Keine passenden Abfahrten."
+    else:
+        message = "MVG Daten werden geladen."
     lines = wrap_lines(draw, message, FONT_BODY, x2 - x1, 5)
     total_h = sum(text_height(draw, line, FONT_BODY) + 4 for line in lines)
     y = y1 + max(0, ((y2 - y1) - total_h) // 2)
@@ -652,59 +661,46 @@ def draw_mvv_card(img, draw, mvv_img, mvv_err, mvv_state):
         y += text_height(draw, line, FONT_BODY) + 4
 
 
-def draw_dashboard(img, weather, rain_eta, weather_err, mvv_img, mvv_err, mvv_state, now_ts=None):
+def draw_dashboard(
+    img,
+    weather,
+    rain_eta,
+    weather_err,
+    departures,
+    mvv_err,
+    mvv_state,
+    now_ts=None,
+    departure_title="MVG Abfahrten",
+):
     d = ImageDraw.Draw(img)
     d.rectangle((0, 0, W, H), fill=255)
     draw_time_weather_panel(d, weather, rain_eta, weather_err, now_ts)
-    draw_mvv_card(img, d, mvv_img, mvv_err, mvv_state)
+    draw_mvv_card(d, departures, mvv_err, mvv_state, title=departure_title)
 
 
 def create_dashboard_frame(
     weather,
     rain_eta,
     weather_err=None,
-    mvv_img=None,
+    departures=None,
     mvv_err=None,
     mvv_state=None,
     now_ts=None,
+    departure_title="MVG Abfahrten",
 ):
     frame = Image.new("1", (W, H), 255)
-    draw_dashboard(frame, weather, rain_eta, weather_err, mvv_img, mvv_err, mvv_state or {}, now_ts)
+    draw_dashboard(
+        frame,
+        weather,
+        rain_eta,
+        weather_err,
+        departures,
+        mvv_err,
+        mvv_state or {},
+        now_ts,
+        departure_title=departure_title,
+    )
     return frame
-
-
-def make_preview_mvv_image(fit_size, rows):
-    width, height = max(1, int(fit_size[0])), max(1, int(fit_size[1]))
-    img = Image.new("1", (width, height), 255)
-    draw = ImageDraw.Draw(img)
-
-    draw.text((0, 0), "Linie", font=FONT_CAPTION, fill=0)
-    draw.text((76, 0), "Ziel", font=FONT_CAPTION, fill=0)
-    min_text = "Min"
-    draw.text((width - text_width(draw, min_text, FONT_CAPTION), 0), min_text, font=FONT_CAPTION, fill=0)
-    draw.line((0, 28, width, 28), fill=0, width=1)
-
-    y = 40
-    row_h = 44
-    for line, destination, minutes in rows:
-        if y + row_h > height:
-            break
-
-        draw.rectangle((0, y, 60, y + 28), fill=0)
-        line_w = text_width(draw, line, FONT_BODY)
-        draw.text((max(4, (60 - line_w) // 2), y + 3), line, font=FONT_BODY, fill=255)
-
-        dest = ellipsize(draw, destination, FONT_BODY, width - 150)
-        draw.text((76, y + 2), dest, font=FONT_BODY, fill=0)
-
-        minutes = str(minutes)
-        minutes_w = text_width(draw, minutes, FONT_BODY)
-        draw.text((width - minutes_w, y + 2), minutes, font=FONT_BODY, fill=0)
-
-        draw.line((0, y + row_h - 5, width, y + row_h - 5), fill=0, width=1)
-        y += row_h
-
-    return img
 
 
 def simulate_screen(panel_img, scale=2):
@@ -726,63 +722,134 @@ def simulate_screen(panel_img, scale=2):
     return canvas
 
 
-def generate_previews(output_dir, scale=2):
+DEFAULT_PREVIEW_CITY = "munich"
+PREVIEW_CITIES = {
+    "munich": {
+        "label": "Munich",
+        "departure_title": "MVG Abfahrten",
+        "scenarios": [
+            {
+                "name": "clear",
+                "weather": {"temp": 21.6, "feels": 22.0, "precip": 0.0, "code": 2, "wind": 9.4},
+                "rain_eta": None,
+                "mvv_rows": [
+                    ("U2", "Messestadt Ost", 3),
+                    ("U2", "Feldmoching", 8),
+                    ("19", "Pasing Bf.", 12),
+                    ("54", "Münchner Freiheit", 18),
+                    ("S8", "Flughafen München", 24),
+                    ("X30", "Harras", 29),
+                ],
+            },
+            {
+                "name": "rain-soon",
+                "weather": {"temp": 12.4, "feels": 10.8, "precip": 0.3, "code": 61, "wind": 27.2},
+                "rain_eta": 18,
+                "mvv_rows": [
+                    ("16", "Romanplatz", 2),
+                    ("17", "Amalienburgstraße", 6),
+                    ("N17", "Effnerplatz", 11),
+                    ("U1", "Olympia-Einkaufszentrum", 14),
+                    ("Bus", "Ostbahnhof", 20),
+                ],
+            },
+            {
+                "name": "weather-error",
+                "weather": None,
+                "weather_err": "Open-Meteo timeout",
+                "rain_eta": None,
+                "mvv_rows": [
+                    ("U6", "Klinikum Großhadern", 4),
+                    ("U6", "Garching-Forschungszentrum", 7),
+                    ("Bus", "Hauptbahnhof Nord", 15),
+                    ("20", "Moosach Bf.", 21),
+                ],
+            },
+        ],
+    },
+    "frankfurt-am-main": {
+        "label": "Frankfurt am Main",
+        "departure_title": "RMV Abfahrten",
+        "scenarios": [
+            {
+                "name": "clear",
+                "weather": {"temp": 19.8, "feels": 20.1, "precip": 0.0, "code": 2, "wind": 11.6},
+                "rain_eta": None,
+                "mvv_rows": [
+                    ("U4", "Bockenheimer Warte", 4),
+                    ("U5", "Preungesheim", 7),
+                    ("S8", "Wiesbaden Hbf", 11),
+                    ("S9", "Hanau Hbf", 15),
+                    ("11", "Schießhüttenstraße", 19),
+                    ("M32", "Ostbahnhof", 24),
+                ],
+            },
+            {
+                "name": "rain-soon",
+                "weather": {"temp": 13.1, "feels": 11.9, "precip": 0.4, "code": 61, "wind": 23.7},
+                "rain_eta": 16,
+                "mvv_rows": [
+                    ("U1", "Ginnheim", 3),
+                    ("U2", "Bad Homburg Gonzenheim", 8),
+                    ("16", "Offenbach Stadtgrenze", 12),
+                    ("S3", "Darmstadt Hbf", 18),
+                    ("M36", "Westbahnhof", 23),
+                ],
+            },
+            {
+                "name": "weather-error",
+                "weather": None,
+                "weather_err": "Open-Meteo timeout",
+                "rain_eta": None,
+                "mvv_rows": [
+                    ("U4", "Enkheim", 5),
+                    ("S1", "Rödermark-Ober Roden", 9),
+                    ("12", "Schwanheim Rheinlandstraße", 14),
+                    ("M34", "Bornheim Mitte", 21),
+                ],
+            },
+        ],
+    },
+}
+
+
+def preview_city_choices_help():
+    return ", ".join(f"{city['label']} ({slug})" for slug, city in PREVIEW_CITIES.items())
+
+
+def normalize_preview_city(value):
+    normalized = value.strip().lower().replace("_", "-")
+    aliases = {
+        slug: slug
+        for slug in PREVIEW_CITIES
+    }
+    aliases.update(
+        {
+            city["label"].strip().lower(): slug
+            for slug, city in PREVIEW_CITIES.items()
+        }
+    )
+    aliases["frankfurt"] = "frankfurt-am-main"
+    return aliases.get(normalized)
+
+
+def generate_previews(output_dir, scale=2, city_slug=DEFAULT_PREVIEW_CITY):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    mvv_size = (RIGHT_CONTENT[2] - RIGHT_CONTENT[0], RIGHT_CONTENT[3] - RIGHT_CONTENT[1])
     now_ts = datetime(2026, 2, 18, 7, 42).timestamp()
-
-    scenarios = [
-        {
-            "name": "clear",
-            "weather": {"temp": 21.6, "feels": 22.0, "precip": 0.0, "code": 2, "wind": 9.4},
-            "rain_eta": None,
-            "mvv_rows": [
-                ("U2", "Messestadt Ost", 3),
-                ("U2", "Feldmoching", 8),
-                ("19", "Pasing Bf.", 12),
-                ("54", "Münchner Freiheit", 18),
-                ("S8", "Flughafen München", 24),
-                ("X30", "Harras", 29),
-            ],
-        },
-        {
-            "name": "rain-soon",
-            "weather": {"temp": 12.4, "feels": 10.8, "precip": 0.3, "code": 61, "wind": 27.2},
-            "rain_eta": 18,
-            "mvv_rows": [
-                ("16", "Romanplatz", 2),
-                ("17", "Amalienburgstraße", 6),
-                ("N17", "Effnerplatz", 11),
-                ("U1", "Olympia-Einkaufszentrum", 14),
-                ("Bus", "Ostbahnhof", 20),
-            ],
-        },
-        {
-            "name": "weather-error",
-            "weather": None,
-            "weather_err": "Open-Meteo timeout",
-            "rain_eta": None,
-            "mvv_rows": [
-                ("U6", "Klinikum Großhadern", 4),
-                ("U6", "Garching-Forschungszentrum", 7),
-                ("Bus", "Hauptbahnhof Nord", 15),
-                ("20", "Moosach Bf.", 21),
-            ],
-        },
-    ]
+    city = PREVIEW_CITIES[city_slug]
 
     written = []
-    for spec in scenarios:
-        mvv_img = make_preview_mvv_image(mvv_size, spec["mvv_rows"])
-        mvv_state = {"last_shot_wall": now_ts - 90}
+    for spec in city["scenarios"]:
+        mvv_state = {"last_update_wall": now_ts - 90}
         frame = create_dashboard_frame(
             spec.get("weather"),
             spec.get("rain_eta"),
             weather_err=spec.get("weather_err"),
-            mvv_img=mvv_img,
+            departures=spec["mvv_rows"],
             mvv_state=mvv_state,
             now_ts=now_ts,
+            departure_title=city["departure_title"],
         )
 
         panel_path = output_dir / f"{spec['name']}-panel.png"
@@ -840,9 +907,8 @@ def push_frame(epd, frame, *, full_refresh: bool):
 
 
 def render_dashboard(epd, frame, weather, rain_eta, weather_err, mvv_state, *, full):
-    mvv_size = (RIGHT_CONTENT[2] - RIGHT_CONTENT[0], RIGHT_CONTENT[3] - RIGHT_CONTENT[1])
-    mvv_img, mvv_err = get_mvv_image_cached(mvv_state, mvv_size)
-    draw_dashboard(frame, weather, rain_eta, weather_err, mvv_img, mvv_err, mvv_state)
+    departures, mvv_err = get_mvv_departures_cached(mvv_state)
+    draw_dashboard(frame, weather, rain_eta, weather_err, departures, mvv_err, mvv_state)
     push_frame(epd, frame, full_refresh=full)
     return mvv_err
 
@@ -862,8 +928,8 @@ def main():
     require_runtime_settings()
     from waveshare_epd import epd7in5_V2
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    cleanup_stale_mvv_temp_files()
+    logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+    logging.info("Statusboard starting")
 
     epd = epd7in5_V2.EPD()
     frame = Image.new("1", (W, H), 255)
@@ -895,6 +961,7 @@ def main():
     last_rain = now
     last_mvv = now
     last_full = now
+    last_status_log = now
 
     render_dashboard(epd, frame, weather_data, rain_eta, weather_error, mvv_state, full=True)
 
@@ -936,10 +1003,20 @@ def main():
                 if render_due:
                     render_dashboard(epd, frame, weather_data, rain_eta, weather_error, mvv_state, full=full_render)
                     last_clock = now
+
+                if now - last_status_log >= STATUS_LOG_INTERVAL:
+                    logging.info(
+                        "Status heartbeat: weather_ok=%s rain_ok=%s mvv_rows=%s mvv_ok=%s",
+                        weather_err is None,
+                        rain_err is None,
+                        len(mvv_state.get("departures") or []),
+                        mvv_state.get("err") is None,
+                    )
+                    last_status_log = now
             except Exception as exc:
                 logging.error("Loop iteration failed: %s", exc)
                 traceback.print_exc()
-                reset_mvv_driver(mvv_state)
+                reset_mvv_state(mvv_state)
                 time.sleep(DISPLAY_RECOVERY_SLEEP)
 
             time.sleep(1)
@@ -950,7 +1027,7 @@ def main():
         logging.error("Unhandled error: %s", exc)
         traceback.print_exc()
     finally:
-        reset_mvv_driver(mvv_state, discard_cache=True)
+        reset_mvv_state(mvv_state, discard_cache=True)
         try:
             epd.sleep()
         except Exception:
@@ -973,13 +1050,24 @@ def parse_args(argv=None):
         default=2,
         help="Scale factor for simulated screen images.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--preview-city",
+        default=DEFAULT_PREVIEW_CITY,
+        metavar="CITY",
+        help=f"Preview city. Available: {preview_city_choices_help()}. Default: Munich.",
+    )
+    args = parser.parse_args(argv)
+    city_slug = normalize_preview_city(args.preview_city)
+    if city_slug is None:
+        parser.error(f"unknown preview city {args.preview_city!r}; choose one of: {preview_city_choices_help()}")
+    args.preview_city = city_slug
+    return args
 
 
 def cli(argv=None):
     args = parse_args(argv)
     if args.preview is not None:
-        written = generate_previews(args.preview, scale=args.preview_scale)
+        written = generate_previews(args.preview, scale=args.preview_scale, city_slug=args.preview_city)
         for path in written:
             print(path)
         return

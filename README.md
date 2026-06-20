@@ -2,7 +2,7 @@
 
 ## Overview
 - Python dashboard for the Waveshare 7.5" e-paper (V2) panel.
-- Shows local weather data (Open-Meteo) and an MVV departure monitor on one integrated screen.
+- Shows local weather data (Open-Meteo) and structured MVV departure data on one integrated screen.
 - Refreshes only when the clock or data needs updating to reduce display and CPU load.
 - Private details (timezone, coordinates, MVV embed) live in `local_settings.py`, which stays out of git.
 
@@ -19,7 +19,7 @@
    - Set `TZ`, `LAT`, `LON`.
    - Paste your MVV monitor HTML snippet (or leave empty to skip MVV).
 2. (Optional) Prepare the Pi: `sudo ./setup.sh`.
-3. Make sure the Python modules (`requests`, `Pillow`, `selenium`, `RPi.GPIO`, `spidev`) are available. `setup.sh` installs the system packages on Raspberry Pi OS.
+3. Make sure the Python modules (`requests`, `Pillow`, `RPi.GPIO`, `spidev`) are available. `setup.sh` installs the system packages on Raspberry Pi OS.
 4. Run the slideshow manually for a quick check: `python3 status.py`.
 
 ## Preview Layouts
@@ -29,11 +29,19 @@ Generate deterministic PNG previews without display hardware or network access:
 python3 status.py --preview
 ```
 
-By default this writes exact `800x480` panel images and larger framed screen simulations to `previews/`. Use `python3 status.py --preview path/to/output` to choose another directory.
+By default this writes exact `800x480` panel images and larger framed screen simulations to `previews/` for Munich. Use `python3 status.py --preview path/to/output` to choose another directory.
+
+Available preview cities:
+
+```sh
+python3 status.py --preview --preview-city munich
+python3 status.py --preview frankfurt-previews --preview-city frankfurt-am-main
+```
 
 ## Long-Running Stability
 - The board keeps the last successful weather and MVG data in memory when a refresh fails.
-- MVG browser sessions are recycled periodically, stale temp files are removed on startup, and retry backoff avoids repeated heavy Selenium launches during outages.
+- MVG departures are fetched as structured EFA JSON rows, cached in memory, and retried with backoff during outages.
+- Logging is intentionally compact: startup, periodic heartbeat, bounded MVV success logs, warnings, and display recovery events without dumping API payloads.
 - The dashboard coalesces clock and data changes into a single refresh when possible.
 - The systemd service restarts the process if it exits unexpectedly, without requiring a Raspberry Pi reboot.
 
@@ -50,4 +58,4 @@ By default this writes exact `800x480` panel images and larger framed screen sim
 
 ## Data Sources
 - [Open-Meteo (DWD ICON)](https://open-meteo.com/en/docs/dwd-api?latitude=48&longitude=11) for weather data.
-- [MVV Departure Monitor](https://www.mvv-muenchen.de/fahrplanauskunft/fuer-entwickler/homepage-services/index.html) for public transport departures.
+- [MVV EFA](https://www.mvv-muenchen.de/fahrplanauskunft/fuer-entwickler/homepage-services/index.html) for public transport departures.
