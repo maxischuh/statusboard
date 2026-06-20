@@ -1,9 +1,9 @@
 # My E-Ink Statusboard
 
 ## Overview
-- Python slideshow for the Waveshare 7.5" e-paper (V2) panel.
-- Rotates between local weather data (Open-Meteo) and an MVV departure monitor.
-- Updates a subtle progress bar every second so the panel shows activity.
+- Python dashboard for the Waveshare 7.5" e-paper (V2) panel.
+- Shows local weather data (Open-Meteo) and an MVV departure monitor on one integrated screen.
+- Refreshes only when the clock or data needs updating to reduce display and CPU load.
 - Private details (timezone, coordinates, MVV embed) live in `local_settings.py`, which stays out of git.
 
 ## Repository Layout
@@ -21,6 +21,21 @@
 2. (Optional) Prepare the Pi: `sudo ./setup.sh`.
 3. Make sure the Python modules (`requests`, `Pillow`, `selenium`, `RPi.GPIO`, `spidev`) are available. `setup.sh` installs the system packages on Raspberry Pi OS.
 4. Run the slideshow manually for a quick check: `python3 status.py`.
+
+## Preview Layouts
+Generate deterministic PNG previews without display hardware or network access:
+
+```sh
+python3 status.py --preview
+```
+
+By default this writes exact `800x480` panel images and larger framed screen simulations to `previews/`. Use `python3 status.py --preview path/to/output` to choose another directory.
+
+## Long-Running Stability
+- The board keeps the last successful weather and MVG data in memory when a refresh fails.
+- MVG browser sessions are recycled periodically, stale temp files are removed on startup, and retry backoff avoids repeated heavy Selenium launches during outages.
+- The dashboard coalesces clock and data changes into a single refresh when possible.
+- The systemd service restarts the process if it exits unexpectedly, without requiring a Raspberry Pi reboot.
 
 ## Run on Boot (systemd)
 1. Ensure `local_settings.py` is in place and working.

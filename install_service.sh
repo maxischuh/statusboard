@@ -33,6 +33,7 @@ cat <<EOF > "${SERVICE_FILE}"
 Description=E-Ink Statusboard
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -40,8 +41,10 @@ User=${SERVICE_USER}
 WorkingDirectory=${SCRIPT_DIR}
 Environment=PYTHONUNBUFFERED=1
 ExecStart=${PYTHON_BIN} ${SCRIPT_DIR}/status.py
-Restart=on-failure
-RestartSec=5
+Restart=always
+RestartSec=20
+KillSignal=SIGINT
+TimeoutStopSec=20
 StandardOutput=journal
 StandardError=journal
 SupplementaryGroups=spi gpio
