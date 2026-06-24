@@ -19,3 +19,13 @@ MVV_HTML = ""
 
 # Optional logging verbosity: DEBUG, INFO, WARNING, ERROR.
 LOG_LEVEL = "INFO"
+
+# Optional display readability tuning. Clock-only updates use partial refreshes;
+# a full refresh is promoted after this many partial updates, after FULL_REFRESH
+# seconds, or after CONTENT_FULL_REFRESH seconds when weather/MVV content changes.
+MAX_PARTIAL_REFRESHES = 5
+FULL_REFRESH = 10 * 60
+CONTENT_FULL_REFRESH = 5 * 60
+
+# Optional hardware setting: disable the Raspberry Pi onboard status LEDs at startup.
+DISABLE_RPI_STATUS_LEDS = True

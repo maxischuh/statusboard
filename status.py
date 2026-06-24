@@ -75,11 +75,12 @@ if hasattr(time, "tzset"):
 # ---------------------------------------------------------------------------
 W, H = 800, 480
 
-CLOCK_REFRESH = 60
 WX_REFRESH = 15 * 60
 RAIN_REFRESH = 5 * 60
 MVV_REFRESH = 120
-FULL_REFRESH = 15 * 60
+FULL_REFRESH = int(_optional_setting("FULL_REFRESH", 10 * 60))
+CONTENT_FULL_REFRESH = int(_optional_setting("CONTENT_FULL_REFRESH", 5 * 60))
+MAX_PARTIAL_REFRESHES = int(_optional_setting("MAX_PARTIAL_REFRESHES", 5))
 
 RAIN_THRESHOLD_MM = 0.1
 RAIN_WINDOW_STEPS = 8
@@ -95,6 +96,8 @@ REQUEST_TIMEOUT = 10
 DISPLAY_MAX_RETRIES = 2
 DISPLAY_RECOVERY_SLEEP = 5
 LOG_LEVEL = str(_optional_setting("LOG_LEVEL", "INFO")).upper()
+DISABLE_RPI_STATUS_LEDS = bool(_optional_setting("DISABLE_RPI_STATUS_LEDS", True))
+RPI_STATUS_LED_NAMES = ("led0", "led1", "ACT", "PWR")
 
 OUTER_PAD = 16
 PANEL_TOP = 14
@@ -212,6 +215,54 @@ def de_date_local(now_ts=None) -> str:
     for k, v in repl.items():
         s = s.replace(k, v)
     return s
+
+
+def minute_key(now_ts=None) -> str:
+    ts = time.time() if now_ts is None else now_ts
+    return time.strftime("%Y%m%d%H%M", time.localtime(ts))
+
+
+def disable_raspberry_pi_status_leds(*, force=False) -> bool:
+    if not force and not DISABLE_RPI_STATUS_LEDS:
+        return False
+
+    led_root = Path("/sys/class/leds")
+    if not led_root.exists():
+        logging.debug("No sysfs LED directory found; skipping Raspberry Pi LED shutdown.")
+        return False
+
+    disabled = []
+    failures = []
+    seen = set()
+    for led_name in RPI_STATUS_LED_NAMES:
+        led_dir = led_root / led_name
+        if not led_dir.exists():
+            continue
+
+        try:
+            led_key = led_dir.resolve()
+        except OSError:
+            led_key = led_dir
+        if led_key in seen:
+            continue
+        seen.add(led_key)
+
+        try:
+            trigger_path = led_dir / "trigger"
+            if trigger_path.exists():
+                trigger_path.write_text("none\n", encoding="ascii")
+            brightness_path = led_dir / "brightness"
+            if brightness_path.exists():
+                brightness_path.write_text("0\n", encoding="ascii")
+            disabled.append(led_name)
+        except OSError as exc:
+            failures.append(f"{led_name}: {exc}")
+
+    if disabled:
+        logging.info("Raspberry Pi status LEDs disabled: %s", ", ".join(disabled))
+    if failures:
+        logging.warning("Could not disable Raspberry Pi status LEDs: %s", "; ".join(failures[:3]))
+    return bool(disabled)
 
 
 def fetch_current_weather():
@@ -906,11 +957,24 @@ def push_frame(epd, frame, *, full_refresh: bool):
     return False
 
 
+def choose_full_refresh(now, *, render_due, pending_content_refresh, partial_refreshes_since_full, last_full):
+    if last_full <= 0:
+        return True, "initial"
+    if now - last_full >= FULL_REFRESH:
+        return True, "periodic"
+    if render_due and partial_refreshes_since_full >= MAX_PARTIAL_REFRESHES:
+        return True, "partial-budget"
+    if render_due and pending_content_refresh and now - last_full >= CONTENT_FULL_REFRESH:
+        return True, "content"
+    return False, "partial"
+
+
 def render_dashboard(epd, frame, weather, rain_eta, weather_err, mvv_state, *, full):
+    render_ts = time.time()
     departures, mvv_err = get_mvv_departures_cached(mvv_state)
-    draw_dashboard(frame, weather, rain_eta, weather_err, departures, mvv_err, mvv_state)
-    push_frame(epd, frame, full_refresh=full)
-    return mvv_err
+    draw_dashboard(frame, weather, rain_eta, weather_err, departures, mvv_err, mvv_state, now_ts=render_ts)
+    display_ok = push_frame(epd, frame, full_refresh=full)
+    return display_ok, mvv_err, minute_key(render_ts)
 
 
 def safe_fetch(fetcher, label):
@@ -930,6 +994,7 @@ def main():
 
     logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
     logging.info("Statusboard starting")
+    disable_raspberry_pi_status_leds()
 
     epd = epd7in5_V2.EPD()
     frame = Image.new("1", (W, H), 255)
@@ -956,53 +1021,87 @@ def main():
 
     mvv_state = {}
     now = time.monotonic()
-    last_clock = now
     last_weather = now
     last_rain = now
     last_mvv = now
-    last_full = now
+    last_full = 0.0
     last_status_log = now
+    partial_refreshes_since_full = 0
+    pending_content_refresh = True
+    last_render_attempt = 0.0
+    rendered_minute = None
 
-    render_dashboard(epd, frame, weather_data, rain_eta, weather_error, mvv_state, full=True)
+    display_ok, _, rendered_minute_key = render_dashboard(epd, frame, weather_data, rain_eta, weather_error, mvv_state, full=True)
+    last_render_attempt = time.monotonic()
+    if display_ok:
+        last_full = last_render_attempt
+        pending_content_refresh = False
+        rendered_minute = rendered_minute_key
 
     try:
         while True:
             try:
                 now = time.monotonic()
-                render_due = False
-                full_render = False
-
-                if now - last_clock >= CLOCK_REFRESH:
-                    render_due = True
+                clock_due = minute_key() != rendered_minute
 
                 if now - last_weather >= WX_REFRESH:
                     new_weather, weather_err = safe_fetch(fetch_current_weather, "weather")
                     if weather_err is None:
                         weather_data = new_weather
                     weather_error = weather_err or rain_err
-                    last_weather = now
-                    render_due = True
+                    last_weather = time.monotonic()
+                    pending_content_refresh = True
 
                 if now - last_rain >= RAIN_REFRESH:
                     new_rain_eta, rain_err = safe_fetch(fetch_rain_eta, "rain")
                     if rain_err is None:
                         rain_eta = new_rain_eta
                     weather_error = weather_err or rain_err
-                    last_rain = now
-                    render_due = True
+                    last_rain = time.monotonic()
+                    pending_content_refresh = True
 
                 if now - last_mvv >= MVV_REFRESH:
-                    last_mvv = now
-                    render_due = True
+                    last_mvv = time.monotonic()
+                    pending_content_refresh = True
 
-                if now - last_full >= FULL_REFRESH:
-                    last_full = now
-                    full_render = True
-                    render_due = True
+                now = time.monotonic()
+                base_render_due = clock_due or pending_content_refresh
+                full_render, refresh_reason = choose_full_refresh(
+                    now,
+                    render_due=base_render_due,
+                    pending_content_refresh=pending_content_refresh,
+                    partial_refreshes_since_full=partial_refreshes_since_full,
+                    last_full=last_full,
+                )
+                render_due = base_render_due or full_render
 
-                if render_due:
-                    render_dashboard(epd, frame, weather_data, rain_eta, weather_error, mvv_state, full=full_render)
-                    last_clock = now
+                if render_due and now - last_render_attempt >= DISPLAY_RECOVERY_SLEEP:
+                    if full_render:
+                        age = f"{int(now - last_full)}s" if last_full > 0 else "n/a"
+                        logging.info(
+                            "Full display refresh: reason=%s partials=%s age=%s",
+                            refresh_reason,
+                            partial_refreshes_since_full,
+                            age,
+                        )
+                    display_ok, _, rendered_minute_key = render_dashboard(
+                        epd,
+                        frame,
+                        weather_data,
+                        rain_eta,
+                        weather_error,
+                        mvv_state,
+                        full=full_render,
+                    )
+                    last_render_attempt = time.monotonic()
+                    if display_ok:
+                        rendered_minute = rendered_minute_key
+                        if full_render:
+                            last_full = last_render_attempt
+                            partial_refreshes_since_full = 0
+                        else:
+                            partial_refreshes_since_full += 1
+                        pending_content_refresh = False
 
                 if now - last_status_log >= STATUS_LOG_INTERVAL:
                     logging.info(
@@ -1056,6 +1155,11 @@ def parse_args(argv=None):
         metavar="CITY",
         help=f"Preview city. Available: {preview_city_choices_help()}. Default: Munich.",
     )
+    parser.add_argument(
+        "--disable-rpi-leds-only",
+        action="store_true",
+        help="Turn off Raspberry Pi status LEDs and exit.",
+    )
     args = parser.parse_args(argv)
     city_slug = normalize_preview_city(args.preview_city)
     if city_slug is None:
@@ -1066,6 +1170,10 @@ def parse_args(argv=None):
 
 def cli(argv=None):
     args = parse_args(argv)
+    if args.disable_rpi_leds_only:
+        logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+        disable_raspberry_pi_status_leds(force=True)
+        return
     if args.preview is not None:
         written = generate_previews(args.preview, scale=args.preview_scale, city_slug=args.preview_city)
         for path in written:

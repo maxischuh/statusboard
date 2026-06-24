@@ -42,8 +42,9 @@ python3 status.py --preview frankfurt-previews --preview-city frankfurt-am-main
 - The board keeps the last successful weather and MVG data in memory when a refresh fails.
 - MVG departures are fetched as structured EFA JSON rows, cached in memory, and retried with backoff during outages.
 - Logging is intentionally compact: startup, periodic heartbeat, bounded MVV success logs, warnings, and display recovery events without dumping API payloads.
-- The dashboard coalesces clock and data changes into a single refresh when possible.
-- The e-paper panel gets a full refresh every 15 minutes to reduce ghosting.
+- The dashboard redraws on actual minute changes and coalesces clock and data changes into a single refresh when possible.
+- Clock-only updates use partial refreshes, but the panel is promoted to a full refresh after five partial updates, after 10 minutes, or after 5 minutes when weather/MVV content changed.
+- The Raspberry Pi onboard status LEDs are turned off at startup; the systemd installer also runs that LED shutdown once as root before the service drops to the dashboard user.
 - The systemd service restarts the process if it exits unexpectedly, without requiring a Raspberry Pi reboot.
 
 ## Run on Boot (systemd)

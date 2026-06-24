@@ -40,6 +40,7 @@ Type=simple
 User=${SERVICE_USER}
 WorkingDirectory=${SCRIPT_DIR}
 Environment=PYTHONUNBUFFERED=1
+ExecStartPre=+${PYTHON_BIN} ${SCRIPT_DIR}/status.py --disable-rpi-leds-only
 ExecStart=${PYTHON_BIN} ${SCRIPT_DIR}/status.py
 Restart=always
 RestartSec=20
