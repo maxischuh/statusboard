@@ -51,6 +51,10 @@ class EPD:
         self.width = EPD_WIDTH
         self.height = EPD_HEIGHT
         self.high_contrast = high_contrast
+        # Waveshare's controller specification maps 0x3F to +/-15 V. Their
+        # current C, STM32, and Arduino drivers all use this symmetric pair.
+        # The Python driver's legacy 0x28/0x17 pair is only +10.4/-7.0 V.
+        self.source_voltage_levels = (0x3F, 0x3F) if high_contrast else (0x28, 0x17)
         self.GRAY1  = GRAY1 #white
         self.GRAY2  = GRAY2
         self.GRAY3  = GRAY3 #gray
@@ -94,16 +98,10 @@ class EPD:
         logger.debug("e-Paper busy release")
 
     def set_vcom_and_data_interval(self):
-        """Apply Waveshare's recommended VCOM setting for this panel batch."""
+        """Apply Waveshare's standard KW-mode data polarity and VCOM interval."""
         self.send_command(0X50)
         self.send_data(0x10)
-        if self.high_contrast:
-            # Waveshare's alternate sequence for panels that render black as gray.
-            self.send_data(0x17)
-            self.send_command(0X52)
-            self.send_data(0x03)
-        else:
-            self.send_data(0x07)
+        self.send_data(0x07)
         
     def init(self):
         if (epdconfig.module_init() != 0):
@@ -120,8 +118,8 @@ class EPD:
         self.send_command(0x01)			#POWER SETTING
         self.send_data(0x07)
         self.send_data(0x07)    #VGH=20V,VGL=-20V
-        self.send_data(0x28)		#VDH=15V
-        self.send_data(0x17)		#VDL=-15V
+        self.send_data(self.source_voltage_levels[0])  # VDH: 0x3F=+15V
+        self.send_data(self.source_voltage_levels[1])  # VDL: 0x3F=-15V
 
         self.send_command(0x04) #POWER ON
         epdconfig.delay_ms(100)
@@ -296,7 +294,7 @@ class EPD:
         image1 = [0xFF] * int(self.width * self.height / 8)
         for j in range(Height):
                 for i in range(Width):
-                    image1[i + j * Width] = ~image[i + j * Width]
+                    image1[i + j * Width] = image[i + j * Width] ^ 0xFF
         self.send_command(0x10)
         self.send_data2(image1)
 
@@ -353,7 +351,7 @@ class EPD:
         image1 = [0xFF] * int(self.width * self.height / 8)
         for j in range(Height):
                 for i in range(Width):
-                    image1[i + j * Width] = ~Image[i + j * Width]
+                    image1[i + j * Width] = Image[i + j * Width] ^ 0xFF
 
         self.send_command(0x13)   #Write Black and White image to RAM
         self.send_data2(image1)

@@ -83,6 +83,8 @@ FULL_REFRESH = int(_optional_setting("FULL_REFRESH", 10 * 60))
 CONTENT_FULL_REFRESH = int(_optional_setting("CONTENT_FULL_REFRESH", 5 * 60))
 MAX_PARTIAL_REFRESHES = int(_optional_setting("MAX_PARTIAL_REFRESHES", 5))
 DISPLAY_HIGH_CONTRAST = bool(_optional_setting("DISPLAY_HIGH_CONTRAST", True))
+PARTIAL_REFRESH_ENABLED = bool(_optional_setting("PARTIAL_REFRESH_ENABLED", False))
+DISPLAY_MIN_REFRESH = max(3 * 60, int(_optional_setting("DISPLAY_MIN_REFRESH", 5 * 60)))
 
 RAIN_THRESHOLD_MM = 0.1
 RAIN_WINDOW_STEPS = 8
@@ -1064,21 +1066,23 @@ def generate_previews(output_dir, scale=2, city_slug=DEFAULT_PREVIEW_CITY):
     return written
 
 
-def initialise_display(epd):
-    epd.init()
-
-
 def recover_display(epd):
     try:
         epd.sleep()
     except Exception:
         pass
     time.sleep(DISPLAY_RECOVERY_SLEEP)
-    initialise_display(epd)
 
 
 def push_frame_once(epd, frame, *, full_refresh: bool):
     buffer = epd.getbuffer(frame)
+    if not PARTIAL_REFRESH_ENABLED:
+        epd.init()
+        epd.Clear()
+        epd.display(buffer)
+        epd.sleep()
+        return
+
     if full_refresh:
         epd.init()
         # A full waveform alone does not reliably remove the light text left by
@@ -1112,6 +1116,8 @@ def push_frame(epd, frame, *, full_refresh: bool):
 
 
 def choose_full_refresh(now, *, render_due, pending_content_refresh, partial_refreshes_since_full, last_full):
+    if not PARTIAL_REFRESH_ENABLED:
+        return True, "quality"
     if last_full <= 0:
         return True, "initial"
     if now - last_full >= FULL_REFRESH:
@@ -1152,22 +1158,12 @@ def main():
 
     epd = epd7in5_V2.EPD(high_contrast=DISPLAY_HIGH_CONTRAST)
     frame = Image.new("1", (W, H), 255)
-
-    for attempt in range(DISPLAY_MAX_RETRIES + 1):
-        try:
-            initialise_display(epd)
-            break
-        except Exception as exc:
-            logging.warning(
-                "Display initialisation failed (%s/%s): %s",
-                attempt + 1,
-                DISPLAY_MAX_RETRIES + 1,
-                exc,
-            )
-            if attempt < DISPLAY_MAX_RETRIES:
-                time.sleep(DISPLAY_RECOVERY_SLEEP)
-    else:
-        raise SystemExit("Failed to initialise display after recovery attempts.")
+    logging.info(
+        "Display drive: source=%s partial=%s min_refresh=%ss",
+        "+/-15V" if DISPLAY_HIGH_CONTRAST else "legacy +10.4/-7.0V",
+        PARTIAL_REFRESH_ENABLED,
+        DISPLAY_MIN_REFRESH if not PARTIAL_REFRESH_ENABLED else 60,
+    )
 
     weather_data, weather_err = safe_fetch(fetch_current_weather, "weather")
     rain_eta, rain_err = safe_fetch(fetch_rain_eta, "rain")
@@ -1229,7 +1225,11 @@ def main():
                 )
                 render_due = base_render_due or full_render
 
-                if render_due and now - last_render_attempt >= DISPLAY_RECOVERY_SLEEP:
+                refresh_delay = DISPLAY_RECOVERY_SLEEP
+                if rendered_minute is not None and not PARTIAL_REFRESH_ENABLED:
+                    refresh_delay = DISPLAY_MIN_REFRESH
+
+                if render_due and now - last_render_attempt >= refresh_delay:
                     if full_render:
                         age = f"{int(now - last_full)}s" if last_full > 0 else "n/a"
                         logging.info(
@@ -1281,10 +1281,13 @@ def main():
         traceback.print_exc()
     finally:
         reset_mvv_state(mvv_state, discard_cache=True)
-        try:
-            epd.sleep()
-        except Exception:
-            pass
+        if PARTIAL_REFRESH_ENABLED:
+            try:
+                epd.sleep()
+            except Exception:
+                pass
+        else:
+            epd7in5_V2.epdconfig.module_exit()
 
 
 def parse_args(argv=None):

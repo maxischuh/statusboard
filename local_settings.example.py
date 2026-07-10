@@ -20,15 +20,21 @@ MVV_HTML = ""
 # Optional logging verbosity: DEBUG, INFO, WARNING, ERROR.
 LOG_LEVEL = "INFO"
 
-# Optional display readability tuning. Clock-only updates use partial refreshes;
-# a full refresh is promoted after this many partial updates, after FULL_REFRESH
-# seconds, or after CONTENT_FULL_REFRESH seconds when weather/MVV content changes.
+# Optional display readability tuning. Partial refresh is disabled by default
+# because this panel's partial waveform produces pale text and must remain
+# powered between updates. Quality mode performs a clean full refresh no more
+# often than every five minutes, then immediately powers the panel down.
+PARTIAL_REFRESH_ENABLED = False
+DISPLAY_MIN_REFRESH = 5 * 60
+
+# These settings apply only when PARTIAL_REFRESH_ENABLED is True.
 MAX_PARTIAL_REFRESHES = 5
 FULL_REFRESH = 10 * 60
 CONTENT_FULL_REFRESH = 5 * 60
 
-# Use Waveshare's alternate VCOM initialization for panels whose black pixels
-# otherwise look gray. Disable only if your particular panel behaves worse.
+# Use the +/-15 V source levels specified by the controller datasheet and used
+# by Waveshare's C, STM32, and Arduino drivers. False restores the lower,
+# asymmetric voltage pair from Waveshare's Python driver for comparison only.
 DISPLAY_HIGH_CONTRAST = True
 
 # Optional hardware setting: disable the Raspberry Pi onboard status LEDs at startup.

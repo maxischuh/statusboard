@@ -3,7 +3,7 @@
 ## Overview
 - Python dashboard for the Waveshare 7.5" e-paper (V2) panel.
 - Shows current local weather, smooth 12-hour temperature and precipitation trends, and structured MVV departure data on one integrated screen.
-- Refreshes only when the clock or data needs updating to reduce display and CPU load.
+- Uses clean full-waveform updates in quality mode and powers the panel down between refreshes.
 - Private details (timezone, coordinates, MVV embed) live in `local_settings.py`, which stays out of git.
 
 ## Repository Layout
@@ -43,7 +43,7 @@ python3 status.py --preview frankfurt-previews --preview-city frankfurt-am-main
 - MVG departures are fetched as structured EFA JSON rows, cached in memory, and retried with backoff during outages.
 - Logging is intentionally compact: startup, periodic heartbeat, bounded MVV success logs, warnings, and display recovery events without dumping API payloads.
 - The dashboard redraws on actual minute changes and coalesces clock and data changes into a single refresh when possible.
-- Clock-only updates use partial refreshes, but the panel is promoted to a clean full refresh after five partial updates, after 10 minutes, or after 5 minutes when weather/MVV content changed. The clean refresh first drives the panel white and then redraws it with Waveshare's high-contrast VCOM setting to restore deep blacks.
+- Quality mode disables the pale full-screen partial waveform, limits display updates to once every five minutes, clears before redrawing, uses the controller's specified +/-15 V source drive, and powers the panel down immediately afterward.
 - The Raspberry Pi onboard status LEDs are turned off at startup; the systemd installer also runs that LED shutdown once as root before the service drops to the dashboard user.
 - The systemd service restarts the process if it exits unexpectedly, without requiring a Raspberry Pi reboot.
 
@@ -66,6 +66,27 @@ sudo systemctl start statusboard.service
 The dashboard service must not access the SPI display while the reset runs. The
 utility detects a running service and exits with instructions unless the unsafe
 `--ignore-running-service` diagnostic option is supplied.
+
+## Contrast Diagnostic
+The diagnostic uses a one-bit image, a clean full refresh, and immediate power
+down, so it isolates the panel drive from dashboard rendering and partial-update
+artifacts:
+
+```sh
+sudo systemctl stop statusboard.service
+python3 display_diagnostic.py --profile full
+```
+
+The large left rectangle and bottom band must be uniformly deep black. If they
+remain gray, check the hardware before tuning software voltages:
+
+1. The driver HAT `Display Config` switch must be at `B / 0.47R` for this 7.5-inch panel.
+2. The interface switch must be in 4-line SPI mode because the driver uses a separate D/C signal.
+3. Confirm the rear panel label says V2. Panels sold before September 2023 require Waveshare's `7.5V2_old` waveform instead.
+4. Check for a stable supply, short display cable, and at least 2.5 V at the panel under refresh load.
+
+To inspect the generated pattern without hardware, run
+`python3 display_diagnostic.py --preview diagnostic-pattern.png`.
 
 ## Hardware
 - [7.5" Waveshare e-Paper HAT V2 (800×480)](https://www.waveshare.com/wiki/7.5inch_e-Paper_HAT_Manual)

@@ -66,9 +66,11 @@ def parse_args(argv=None):
         help="Reset even if statusboard.service is active (unsafe; use only for diagnostics).",
     )
     parser.add_argument(
+        "--legacy-voltage",
         "--standard-contrast",
+        dest="legacy_voltage",
         action="store_true",
-        help="Use Waveshare's standard VCOM setting instead of the configured high-contrast setting.",
+        help="Use the Python driver's legacy +10.4/-7.0 V source pair instead of the configured profile.",
     )
     return parser.parse_args(argv)
 
@@ -85,9 +87,12 @@ def main(argv=None) -> int:
 
     from waveshare_epd import epd7in5_V2
 
-    high_contrast = display_high_contrast_enabled() and not args.standard_contrast
+    high_contrast = display_high_contrast_enabled() and not args.legacy_voltage
     epd = epd7in5_V2.EPD(high_contrast=high_contrast)
-    logging.info("Starting full display reset (high_contrast=%s)", high_contrast)
+    logging.info(
+        "Starting full display reset with %s source profile",
+        "+/-15 V" if high_contrast else "legacy +10.4/-7.0 V",
+    )
 
     try:
         reset_panel(epd)
