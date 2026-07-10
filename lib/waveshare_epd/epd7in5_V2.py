@@ -43,13 +43,14 @@ GRAY4  = 0x00 #Blackest
 logger = logging.getLogger(__name__)
 
 class EPD:
-    def __init__(self):
+    def __init__(self, high_contrast=False):
         self.reset_pin = epdconfig.RST_PIN
         self.dc_pin = epdconfig.DC_PIN
         self.busy_pin = epdconfig.BUSY_PIN
         self.cs_pin = epdconfig.CS_PIN
         self.width = EPD_WIDTH
         self.height = EPD_HEIGHT
+        self.high_contrast = high_contrast
         self.GRAY1  = GRAY1 #white
         self.GRAY2  = GRAY2
         self.GRAY3  = GRAY3 #gray
@@ -91,6 +92,18 @@ class EPD:
             busy = epdconfig.digital_read(self.busy_pin)
         epdconfig.delay_ms(20)
         logger.debug("e-Paper busy release")
+
+    def set_vcom_and_data_interval(self):
+        """Apply Waveshare's recommended VCOM setting for this panel batch."""
+        self.send_command(0X50)
+        self.send_data(0x10)
+        if self.high_contrast:
+            # Waveshare's alternate sequence for panels that render black as gray.
+            self.send_data(0x17)
+            self.send_command(0X52)
+            self.send_data(0x03)
+        else:
+            self.send_data(0x07)
         
     def init(self):
         if (epdconfig.module_init() != 0):
@@ -126,15 +139,7 @@ class EPD:
         self.send_command(0X15)
         self.send_data(0x00)
 
-        # If the screen appears gray, use the annotated initialization command
-        self.send_command(0X50)
-        self.send_data(0x10)
-        self.send_data(0x07)
-        # self.send_command(0X50)
-        # self.send_data(0x10)
-        # self.send_data(0x17)
-        # self.send_command(0X52)		
-        # self.send_data(0x03)
+        self.set_vcom_and_data_interval()
 
         self.send_command(0X60)			#TCON SETTING
         self.send_data(0x22)
@@ -151,15 +156,7 @@ class EPD:
         self.send_command(0X00)			#PANNEL SETTING
         self.send_data(0x1F)   #KW-3f   KWR-2F	BWROTP 0f	BWOTP 1f
 
-        # If the screen appears gray, use the annotated initialization command
-        self.send_command(0X50)
-        self.send_data(0x10)
-        self.send_data(0x07)
-        # self.send_command(0X50)
-        # self.send_data(0x10)
-        # self.send_data(0x17)
-        # self.send_command(0X52)		
-        # self.send_data(0x03)
+        self.set_vcom_and_data_interval()
 
         self.send_command(0x04) #POWER ON
         epdconfig.delay_ms(100) 

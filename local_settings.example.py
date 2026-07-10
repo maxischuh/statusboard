@@ -27,5 +27,9 @@ MAX_PARTIAL_REFRESHES = 5
 FULL_REFRESH = 10 * 60
 CONTENT_FULL_REFRESH = 5 * 60
 
+# Use Waveshare's alternate VCOM initialization for panels whose black pixels
+# otherwise look gray. Disable only if your particular panel behaves worse.
+DISPLAY_HIGH_CONTRAST = True
+
 # Optional hardware setting: disable the Raspberry Pi onboard status LEDs at startup.
 DISABLE_RPI_STATUS_LEDS = True

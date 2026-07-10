@@ -11,6 +11,7 @@ import argparse
 import base64
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -81,9 +82,11 @@ MVV_REFRESH = 120
 FULL_REFRESH = int(_optional_setting("FULL_REFRESH", 10 * 60))
 CONTENT_FULL_REFRESH = int(_optional_setting("CONTENT_FULL_REFRESH", 5 * 60))
 MAX_PARTIAL_REFRESHES = int(_optional_setting("MAX_PARTIAL_REFRESHES", 5))
+DISPLAY_HIGH_CONTRAST = bool(_optional_setting("DISPLAY_HIGH_CONTRAST", True))
 
 RAIN_THRESHOLD_MM = 0.1
 RAIN_WINDOW_STEPS = 8
+FORECAST_HOURS = 13
 
 MVV_EFA_URL = "https://efa.mvv-muenchen.de/ng/XML_DM_REQUEST"
 MVV_FETCH_LIMIT_MARGIN = 3
@@ -146,11 +149,11 @@ FONT_SM = _load_font(26)
 FONT_PANEL_TIME = _load_font(104)
 FONT_PANEL_DATE = _load_font(24)
 FONT_CARD_TITLE = _load_font(28)
-FONT_TEMP = _load_font(78)
+FONT_TEMP = _load_font(50)
 FONT_BODY = _load_font(24)
 FONT_CAPTION = _load_font(20)
 FONT_METRIC_LABEL = _load_font(18)
-FONT_METRIC_VALUE = _load_font(22)
+FONT_BADGE = _load_font(17)
 
 
 WMO_DE = {
@@ -280,10 +283,14 @@ def fetch_current_weather():
             "weather_code",
             "wind_speed_10m",
         ],
+        "hourly": ["temperature_2m", "precipitation"],
+        "forecast_hours": FORECAST_HOURS,
     }
     resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
-    current = resp.json().get("current") or {}
+    payload = resp.json()
+    current = payload.get("current") or {}
+    hourly = payload.get("hourly") or {}
     return {
         "time": current.get("time"),
         "temp": current.get("temperature_2m"),
@@ -291,6 +298,11 @@ def fetch_current_weather():
         "precip": current.get("precipitation"),
         "code": current.get("weather_code"),
         "wind": current.get("wind_speed_10m"),
+        "forecast": {
+            "time": (hourly.get("time") or [])[:FORECAST_HOURS],
+            "temperature": (hourly.get("temperature_2m") or [])[:FORECAST_HOURS],
+            "precipitation": (hourly.get("precipitation") or [])[:FORECAST_HOURS],
+        },
     }
 
 
@@ -577,11 +589,92 @@ def draw_card_frame(draw, box, title, subtitle):
     draw.text((x1 + CARD_PAD, y1 + 6), ellipsize(draw, title, FONT_CARD_TITLE, max_title), font=FONT_CARD_TITLE, fill=0)
 
 
-def draw_metric_row(draw, y, label, value, x1, x2):
-    draw.text((x1, y + 2), label, font=FONT_METRIC_LABEL, fill=0)
-    value = ellipsize(draw, value, FONT_METRIC_VALUE, max(70, x2 - x1 - 110))
-    vw = text_width(draw, value, FONT_METRIC_VALUE)
-    draw.text((x2 - vw, y), value, font=FONT_METRIC_VALUE, fill=0)
+def smooth_curve_points(points, samples_per_segment=6):
+    """Return a Catmull-Rom interpolation through the supplied plot points."""
+    if len(points) < 3:
+        return points
+
+    smoothed = []
+    for idx in range(len(points) - 1):
+        p0 = points[max(0, idx - 1)]
+        p1 = points[idx]
+        p2 = points[idx + 1]
+        p3 = points[min(len(points) - 1, idx + 2)]
+        for step in range(samples_per_segment):
+            t = step / samples_per_segment
+            t2 = t * t
+            t3 = t2 * t
+            x = 0.5 * (
+                (2 * p1[0])
+                + (-p0[0] + p2[0]) * t
+                + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2
+                + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3
+            )
+            y = 0.5 * (
+                (2 * p1[1])
+                + (-p0[1] + p2[1]) * t
+                + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2
+                + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3
+            )
+            smoothed.append((round(x), round(y)))
+    smoothed.append(points[-1])
+    return smoothed
+
+
+def draw_forecast_curve(draw, box, label, values, *, kind):
+    x1, y1, x2, y2 = box
+    numeric = [
+        float(value)
+        for value in values
+        if isinstance(value, (int, float)) and math.isfinite(value)
+    ]
+
+    draw.text((x1, y1), label, font=FONT_METRIC_LABEL, fill=0)
+    if not numeric:
+        message = "Keine Prognose"
+        message_w = text_width(draw, message, FONT_METRIC_LABEL)
+        draw.text((x2 - message_w, y1), message, font=FONT_METRIC_LABEL, fill=0)
+        return
+
+    actual_min = min(numeric)
+    actual_max = max(numeric)
+    if kind == "temperature":
+        range_text = f"{round(actual_min)}–{round(actual_max)}°"
+        scale_min = actual_min
+        scale_max = actual_max
+        if scale_max - scale_min < 4:
+            centre = (scale_min + scale_max) / 2
+            scale_min = centre - 2
+            scale_max = centre + 2
+    else:
+        range_text = f"max {actual_max:.1f} mm"
+        scale_min = 0.0
+        scale_max = max(1.0, actual_max)
+
+    range_w = text_width(draw, range_text, FONT_METRIC_LABEL)
+    draw.text((x2 - range_w, y1), range_text, font=FONT_METRIC_LABEL, fill=0)
+
+    plot_top = y1 + 24
+    plot_bottom = y2 - 2
+    draw.line((x1, plot_bottom, x2, plot_bottom), fill=0, width=1)
+    plot_width = x2 - x1
+    plot_height = max(1, plot_bottom - plot_top)
+    value_span = max(0.001, scale_max - scale_min)
+    points = []
+    for idx, value in enumerate(numeric):
+        x = x1 if len(numeric) == 1 else x1 + (plot_width * idx / (len(numeric) - 1))
+        normalized = (value - scale_min) / value_span
+        y = plot_bottom - (normalized * plot_height)
+        points.append((round(x), round(max(plot_top, min(plot_bottom, y)))))
+
+    curve = smooth_curve_points(points)
+    curve = [
+        (max(x1, min(x2, x)), max(plot_top, min(plot_bottom, y)))
+        for x, y in curve
+    ]
+    draw.line(curve, fill=0, width=2)
+    for x, y in (points[0], points[-1]):
+        draw.ellipse((x - 2, y - 2, x + 2, y + 2), fill=0)
 
 
 def draw_time_weather_panel(draw, weather, rain_eta, err, now_ts=None):
@@ -597,7 +690,7 @@ def draw_time_weather_panel(draw, weather, rain_eta, err, now_ts=None):
     draw.text((x1 + 3, y1 + 92), ellipsize(draw, date_text, FONT_PANEL_DATE, max_w), font=FONT_PANEL_DATE, fill=0)
     draw.line((x1, y1 + 138, x2, y1 + 138), fill=0, width=2)
 
-    y = y1 + 158
+    y = y1 + 152
     if err and not weather:
         lines = wrap_lines(draw, f"Fehler: {err}", FONT_BODY, max_w, 6)
         for line in lines:
@@ -608,41 +701,60 @@ def draw_time_weather_panel(draw, weather, rain_eta, err, now_ts=None):
     temp = weather.get("temp") if weather else None
     temp_text = "--°C" if temp is None else f"{round(temp)}°C"
     draw.text((x1, y), temp_text, font=FONT_TEMP, fill=0)
-    y += text_height(draw, temp_text, FONT_TEMP) + 14
 
     code = weather.get("code") if weather else None
     cond = WMO_DE.get(int(code) if code is not None else 3, "Keine Wetterdaten")
-    for line in wrap_lines(draw, cond, FONT_BODY, max_w, 2):
-        draw.text((x1, y), line, font=FONT_BODY, fill=0)
-        y += text_height(draw, line, FONT_BODY) + 3
+    summary_x = x1 + 134
+    summary_y = y + 2
+    for line in wrap_lines(draw, cond, FONT_CAPTION, x2 - summary_x, 2):
+        draw.text((summary_x, summary_y), line, font=FONT_CAPTION, fill=0)
+        summary_y += text_height(draw, line, FONT_CAPTION) + 3
 
     badge = rain_label(rain_eta)
-    bw = text_width(draw, badge, FONT_BODY) + 14
-    bh = text_height(draw, badge, FONT_BODY) + 8
-    if y + bh <= y2 - 96:
-        draw.rectangle((x1, y + 2, x1 + bw, y + 2 + bh), fill=0)
-        draw.text((x1 + 7, y + 6), badge, font=FONT_BODY, fill=255)
-        y += bh + 10
+    bw = min(x2 - summary_x, text_width(draw, badge, FONT_BADGE) + 10)
+    bh = text_height(draw, badge, FONT_BADGE) + 7
+    badge_y = y + 43
+    draw.rectangle((summary_x, badge_y, summary_x + bw, badge_y + bh), fill=0)
+    draw.text(
+        (summary_x + 5, badge_y + 3),
+        ellipsize(draw, badge, FONT_BADGE, bw - 10),
+        font=FONT_BADGE,
+        fill=255,
+    )
 
-    metric_rows = []
+    metrics = []
     if err:
-        metric_rows.append(("Status", "Updatefehler"))
+        metrics.append("Updatefehler")
     feels = weather.get("feels") if weather else None
     if feels is not None:
-        metric_rows.append(("Gefühlt", f"{round(feels)}°C"))
+        metrics.append(f"Gef. {round(feels)}°")
     wind = weather.get("wind") if weather else None
     if wind is not None:
-        metric_rows.append(("Wind", f"{round(wind)} km/h"))
-    precip = weather.get("precip") if weather else None
-    if precip is not None:
-        metric_rows.append(("Regen", f"{precip:.1f} mm"))
+        metrics.append(f"Wind {round(wind)} km/h")
+    metric_text = " · ".join(metrics)
+    draw.text(
+        (x1, y1 + 226),
+        ellipsize(draw, metric_text, FONT_CAPTION, max_w),
+        font=FONT_CAPTION,
+        fill=0,
+    )
 
-    if metric_rows:
-        metric_y = max(y + 8, y2 - 95)
-        draw.line((x1, metric_y - 10, x2, metric_y - 10), fill=0, width=1)
-        for label, value in metric_rows[:3]:
-            draw_metric_row(draw, metric_y, label, value, x1, x2)
-            metric_y += 30
+    draw.line((x1, y1 + 250, x2, y1 + 250), fill=0, width=1)
+    forecast = (weather or {}).get("forecast") or {}
+    draw_forecast_curve(
+        draw,
+        (x1, y1 + 258, x2, y1 + 323),
+        "Temperatur · 12h",
+        forecast.get("temperature") or [],
+        kind="temperature",
+    )
+    draw_forecast_curve(
+        draw,
+        (x1, y1 + 335, x2, y2 - 4),
+        "Regen · 12h",
+        forecast.get("precipitation") or [],
+        kind="precipitation",
+    )
 
 
 def normalize_departure_row(row):
@@ -781,7 +893,17 @@ PREVIEW_CITIES = {
         "scenarios": [
             {
                 "name": "clear",
-                "weather": {"temp": 21.6, "feels": 22.0, "precip": 0.0, "code": 2, "wind": 9.4},
+                "weather": {
+                    "temp": 21.6,
+                    "feels": 22.0,
+                    "precip": 0.0,
+                    "code": 2,
+                    "wind": 9.4,
+                    "forecast": {
+                        "temperature": [21.6, 22.4, 23.1, 23.8, 24.2, 24.0, 23.5, 22.7, 21.8, 20.9, 20.1, 19.5, 18.9],
+                        "precipitation": [0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    },
+                },
                 "rain_eta": None,
                 "mvv_rows": [
                     ("U2", "Messestadt Ost", 3),
@@ -794,7 +916,17 @@ PREVIEW_CITIES = {
             },
             {
                 "name": "rain-soon",
-                "weather": {"temp": 12.4, "feels": 10.8, "precip": 0.3, "code": 61, "wind": 27.2},
+                "weather": {
+                    "temp": 12.4,
+                    "feels": 10.8,
+                    "precip": 0.3,
+                    "code": 61,
+                    "wind": 27.2,
+                    "forecast": {
+                        "temperature": [12.4, 12.1, 11.8, 11.5, 11.3, 11.6, 12.0, 12.5, 12.9, 13.1, 12.8, 12.2, 11.7],
+                        "precipitation": [0.3, 0.8, 1.6, 2.4, 1.9, 1.1, 0.5, 0.2, 0.0, 0.0, 0.1, 0.0, 0.0],
+                    },
+                },
                 "rain_eta": 18,
                 "mvv_rows": [
                     ("16", "Romanplatz", 2),
@@ -824,7 +956,17 @@ PREVIEW_CITIES = {
         "scenarios": [
             {
                 "name": "clear",
-                "weather": {"temp": 19.8, "feels": 20.1, "precip": 0.0, "code": 2, "wind": 11.6},
+                "weather": {
+                    "temp": 19.8,
+                    "feels": 20.1,
+                    "precip": 0.0,
+                    "code": 2,
+                    "wind": 11.6,
+                    "forecast": {
+                        "temperature": [19.8, 20.6, 21.5, 22.3, 22.9, 23.2, 22.8, 22.0, 21.1, 20.3, 19.6, 19.0, 18.5],
+                        "precipitation": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    },
+                },
                 "rain_eta": None,
                 "mvv_rows": [
                     ("U4", "Bockenheimer Warte", 4),
@@ -837,7 +979,17 @@ PREVIEW_CITIES = {
             },
             {
                 "name": "rain-soon",
-                "weather": {"temp": 13.1, "feels": 11.9, "precip": 0.4, "code": 61, "wind": 23.7},
+                "weather": {
+                    "temp": 13.1,
+                    "feels": 11.9,
+                    "precip": 0.4,
+                    "code": 61,
+                    "wind": 23.7,
+                    "forecast": {
+                        "temperature": [13.1, 12.8, 12.5, 12.3, 12.0, 12.2, 12.7, 13.3, 13.8, 14.0, 13.7, 13.2, 12.6],
+                        "precipitation": [0.4, 1.0, 1.8, 2.1, 1.4, 0.9, 0.3, 0.1, 0.0, 0.0, 0.0, 0.1, 0.0],
+                    },
+                },
                 "rain_eta": 16,
                 "mvv_rows": [
                     ("U1", "Ginnheim", 3),
@@ -914,8 +1066,6 @@ def generate_previews(output_dir, scale=2, city_slug=DEFAULT_PREVIEW_CITY):
 
 def initialise_display(epd):
     epd.init()
-    epd.Clear()
-    epd.init_part()
 
 
 def recover_display(epd):
@@ -931,6 +1081,10 @@ def push_frame_once(epd, frame, *, full_refresh: bool):
     buffer = epd.getbuffer(frame)
     if full_refresh:
         epd.init()
+        # A full waveform alone does not reliably remove the light text left by
+        # repeated partial updates on this panel. Waveshare recommends a clear
+        # cycle after five partial refreshes before drawing the next full frame.
+        epd.Clear()
         epd.display(buffer)
         epd.init_part()
     else:
@@ -996,7 +1150,7 @@ def main():
     logging.info("Statusboard starting")
     disable_raspberry_pi_status_leds()
 
-    epd = epd7in5_V2.EPD()
+    epd = epd7in5_V2.EPD(high_contrast=DISPLAY_HIGH_CONTRAST)
     frame = Image.new("1", (W, H), 255)
 
     for attempt in range(DISPLAY_MAX_RETRIES + 1):

@@ -2,7 +2,7 @@
 
 ## Overview
 - Python dashboard for the Waveshare 7.5" e-paper (V2) panel.
-- Shows local weather data (Open-Meteo) and structured MVV departure data on one integrated screen.
+- Shows current local weather, smooth 12-hour temperature and precipitation trends, and structured MVV departure data on one integrated screen.
 - Refreshes only when the clock or data needs updating to reduce display and CPU load.
 - Private details (timezone, coordinates, MVV embed) live in `local_settings.py`, which stays out of git.
 
@@ -43,7 +43,7 @@ python3 status.py --preview frankfurt-previews --preview-city frankfurt-am-main
 - MVG departures are fetched as structured EFA JSON rows, cached in memory, and retried with backoff during outages.
 - Logging is intentionally compact: startup, periodic heartbeat, bounded MVV success logs, warnings, and display recovery events without dumping API payloads.
 - The dashboard redraws on actual minute changes and coalesces clock and data changes into a single refresh when possible.
-- Clock-only updates use partial refreshes, but the panel is promoted to a full refresh after five partial updates, after 10 minutes, or after 5 minutes when weather/MVV content changed.
+- Clock-only updates use partial refreshes, but the panel is promoted to a clean full refresh after five partial updates, after 10 minutes, or after 5 minutes when weather/MVV content changed. The clean refresh first drives the panel white and then redraws it with Waveshare's high-contrast VCOM setting to restore deep blacks.
 - The Raspberry Pi onboard status LEDs are turned off at startup; the systemd installer also runs that LED shutdown once as root before the service drops to the dashboard user.
 - The systemd service restarts the process if it exits unexpectedly, without requiring a Raspberry Pi reboot.
 
@@ -54,7 +54,7 @@ python3 status.py --preview frankfurt-previews --preview-city frankfurt-am-main
 4. Disable or remove later with `sudo systemctl disable --now statusboard.service`.
 
 ## Hardware
-- [7.5" Waveshare e-Paper (HD)](https://www.waveshare.com/wiki/7.5inch_HD_e-Paper_HAT)
+- [7.5" Waveshare e-Paper HAT V2 (800×480)](https://www.waveshare.com/wiki/7.5inch_e-Paper_HAT_Manual)
 - [Raspberry Pi Zero 2 (WH)](https://www.raspberrypi.com/products/raspberry-pi-zero-2-w/)
 - Micro-USB power supply
 
