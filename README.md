@@ -53,6 +53,20 @@ python3 status.py --preview frankfurt-previews --preview-city frankfurt-am-main
 3. Check status: `sudo systemctl status statusboard.service`.
 4. Disable or remove later with `sudo systemctl disable --now statusboard.service`.
 
+## Full Display Reset
+Use the standalone reset utility to run the hardware reset sequence, clear the
+panel to white with a full waveform, and power the driver board down cleanly:
+
+```sh
+sudo systemctl stop statusboard.service
+python3 reset_display.py
+sudo systemctl start statusboard.service
+```
+
+The dashboard service must not access the SPI display while the reset runs. The
+utility detects a running service and exits with instructions unless the unsafe
+`--ignore-running-service` diagnostic option is supplied.
+
 ## Hardware
 - [7.5" Waveshare e-Paper HAT V2 (800×480)](https://www.waveshare.com/wiki/7.5inch_e-Paper_HAT_Manual)
 - [Raspberry Pi Zero 2 (WH)](https://www.raspberrypi.com/products/raspberry-pi-zero-2-w/)
